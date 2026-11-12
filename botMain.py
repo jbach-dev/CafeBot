@@ -1,8 +1,15 @@
 import discord
 import datetime
+import os
 from discord.ext import commands, tasks
 from typing import Optional
 import DataStorage
+from Permissions import (
+    is_authorized,
+    is_authorized_interaction,
+    slash_auth_check,
+    check_cmd_permission,
+)
 
 import DndModule
 import EconomyModule
@@ -61,6 +68,32 @@ config = dotenv_values(".env")
 DataStorage.administrators = config.get("administrators").split(",")
 
 
+EXTENSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "extensions")
+
+
+async def load_extensions():
+    """Load every package in extensions/ (a folder containing __init__.py) with bot.load_extension.
+    Does nothing if the folder doesn't exist."""
+    if not os.path.isdir(EXTENSIONS_DIR):
+        return
+    for name in sorted(os.listdir(EXTENSIONS_DIR)):
+        if name.startswith((".", "_")):
+            continue
+        if not os.path.isfile(os.path.join(EXTENSIONS_DIR, name, "__init__.py")):
+            continue
+        try:
+            await bot.load_extension(f"extensions.{name}")
+            print(f"Loaded extension: {name}")
+        except Exception as e:
+            print(f"Failed to load extension {name}: {e!r}")
+
+
+async def setup_hook():
+    await load_extensions()
+
+bot.setup_hook = setup_hook
+
+
 def _match_member_by_name(guild, argument: str):
     """Case-insensitive scan of guild.members against display_name, global_name, and name."""
     needle = argument.lower()
@@ -108,113 +141,6 @@ class FlexibleUser(commands.UserConverter):
                 if match is not None:
                     return match
             raise
-
-
-_DM_REJECT_MESSAGE = "⚠️ This command must be used in a server, not a DM."
-_DM_FALLBACK_UNSET_MESSAGE = "⚠️ Set a default server first with `.dm_server` to use this command in DMs."
-_DM_FALLBACK_STALE_MESSAGE = "⚠️ Your DM default server is no longer valid. Run `.dm_server` to pick a new one."
-
-
-def _resolve_dm_fallback(user_id: int):
-    """For a DM invocation with dm_fallback=True, return (ok, error_message).
-    ok=True means the gate should let the command through; the resolved guild id is on the User."""
-    user_data = DataStorage.get_or_create_user(user_id)
-    target = user_data.default_dm_guild_id
-    if not target:
-        return False, _DM_FALLBACK_UNSET_MESSAGE
-    guild = bot.get_guild(int(target))
-    if guild is None or guild.get_member(user_id) is None:
-        return False, _DM_FALLBACK_STALE_MESSAGE
-    return True, None
-
-
-def is_authorized(required_type: str = "any", guild_only: bool = False, dm_fallback: bool = False):
-    async def predicate(ctx):
-        # Guild gate — applies to all non-"any" auth types implicitly, plus any "any" command
-        # that opts in. Even bot-admin DMs are blocked because per-guild commands need guild context.
-        needs_guild = guild_only or required_type != "any"
-        if needs_guild and ctx.guild is None:
-            if dm_fallback:
-                ok, err = _resolve_dm_fallback(ctx.author.id)
-                if not ok:
-                    await ctx.send(err)
-                    return False
-            else:
-                await ctx.send(_DM_REJECT_MESSAGE)
-                return False
-
-        if str(ctx.author.id) in DataStorage.administrators:
-            return True
-
-        if required_type == "server_admin":
-            return ctx.author.guild_permissions.administrator
-
-        elif required_type == "moderator":
-            return ctx.author.guild_permissions.manage_messages
-
-        elif required_type == "kick":
-            return ctx.author.guild_permissions.kick_members
-
-        elif required_type == "ban":
-            return ctx.author.guild_permissions.ban_members
-
-        elif required_type == "mute":
-            return ctx.author.guild_permissions.moderate_members
-
-        elif required_type == "bot_admin":
-            # Commands for only bot administrators
-            return False
-
-        elif required_type == "any":
-            # Anyone can use this command
-            return True
-
-        # Default: deny access
-        return False
-
-    return commands.check(predicate)
-
-
-async def is_authorized_interaction(interaction: discord.Interaction, required_type: str) -> bool:
-    if str(interaction.user.id) in DataStorage.administrators:
-        return True
-    if required_type == "any":
-        return True
-    if not interaction.guild:
-        return False
-    member = interaction.guild.get_member(interaction.user.id)
-    if not member:
-        return False
-    if required_type == "server_admin":
-        return member.guild_permissions.administrator
-    elif required_type == "moderator":
-        return member.guild_permissions.manage_messages
-    elif required_type == "kick":
-        return member.guild_permissions.kick_members
-    elif required_type == "ban":
-        return member.guild_permissions.ban_members
-    elif required_type == "mute":
-        return member.guild_permissions.moderate_members
-    elif required_type == "bot_admin":
-        return False
-    return False
-
-
-async def slash_auth_check(interaction: discord.Interaction, required_type: str, guild_only: bool = False, dm_fallback: bool = False) -> bool:
-    needs_guild = guild_only or required_type != "any"
-    if needs_guild and interaction.guild is None:
-        if dm_fallback:
-            ok, err = _resolve_dm_fallback(interaction.user.id)
-            if not ok:
-                await interaction.response.send_message(err, ephemeral=True)
-                return False
-        else:
-            await interaction.response.send_message(_DM_REJECT_MESSAGE, ephemeral=True)
-            return False
-    if not await is_authorized_interaction(interaction, required_type):
-        await interaction.response.send_message("🚫 You don't have permission to use this command.", ephemeral=True)
-        return False
-    return True
 
 
 def parse_duration(s):
@@ -293,33 +219,6 @@ async def on_ready():
 
 
 # --- HELP MENU CONFIGURATION ---
-
-# 1. Helper function to check if a user can see a command
-def check_cmd_permission(ctx, required_type):
-    # Bot admins can see everything
-    if str(ctx.author.id) in DataStorage.administrators:
-        return True
-
-    if isinstance(ctx.channel, discord.DMChannel):
-        return True # Temporary fix, users will be able to see commands they normally cant
-
-    if required_type == "any":
-        return True
-    elif required_type == "server_admin":
-        return ctx.author.guild_permissions.administrator
-    elif required_type == "moderator":
-        return ctx.author.guild_permissions.manage_messages
-    elif required_type == "kick":
-        return ctx.author.guild_permissions.kick_members
-    elif required_type == "ban":
-        return ctx.author.guild_permissions.ban_members
-    elif required_type == "mute":
-        return ctx.author.guild_permissions.moderate_members
-    elif required_type == "bot_admin":
-        return False
-
-    return False
-
 
 # 2. Format: ("Command Usage", "Description", "Required Permission")
 COMMAND_MODULES = {
@@ -1623,7 +1522,8 @@ async def debug_node(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CheckFailure):
-        await ctx.send("🚫 You don't have permission to use this command.")
+        # Prefix denials are silent in chat, same as an unknown command; console only.
+        print(f"Permission denied: {ctx.author} ({ctx.author.id}) used .{ctx.invoked_with}")
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"❌ Missing argument: `{error.param.name}`")
     elif isinstance(error, commands.BadArgument):
